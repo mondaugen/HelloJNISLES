@@ -6,6 +6,7 @@
 #include <string.h>
 #include <android/log.h>
 #include <math.h>
+#include "sa_spat_svz.h"
 #include "audio_buffer_ring.h"
 
 #if 1
@@ -32,7 +33,8 @@
 #define _ROUND_ALIGN(s, a) (((s) / (a) + (((s) % (a)) != 0)) * (a))
 
 #define DEVICE_SHADOW_BUFFER_QUEUE_LEN      4
-#define  SINE_FREQ 220.
+#define BLOCK_SIZE 512
+#define N_IN_CHANS 3
 
 #define SLASSERT(x)   do {\
     LOGI("Checking, x = %u",(unsigned)x);\
@@ -40,11 +42,28 @@
     (void) (x);\
     } while (0)
 
+/* Synthesize impulse train */
 struct synth_t {
     float phs;
     float freq;
+    float crossed;
 };
 typedef struct synth_t synth_t;
+
+/* Assumes positive frequency */
+float synth_tick(synth_t *synth, float sample_rate)
+{
+    float ret = synth->crossed;
+    synth->crossed = 0;
+    synth->phs += 1./sample_rate * synth->freq;
+    if (synth->phs >= 1.) {
+        synth->crossed = 1.;
+    }
+    while (synth->phs >= 1.) {
+        synth->phs -= 1.;
+    }
+    return ret;
+}
 
 struct wavetable_t {
     int16_t *ptr;
@@ -62,10 +81,13 @@ struct SampleFormat {
 typedef struct SampleFormat SampleFormat;
 
 struct audio_player_t {
-    synth_t synth;
+    synth_t *synths;
     SampleFormat sampleInfo_;
     volatile int done;
     audio_buffer_ring_t *arng;
+    SASpatSVZ *svz;
+    SASpatSVZRenderer *rend;
+    float *indat;
 };
 typedef struct audio_player_t audio_player_t;
 
@@ -116,24 +138,44 @@ void ConvertToSLSampleFormat(SLAndroidDataFormat_PCM_EX *pFormat,
     }
 }
 
+void render_callback (
+            float **in,
+            size_t n_in_chans,
+            size_t n_frames,
+            void *aux)
+{
+    audio_player_t *audio_player = aux;
+    synth_t *synths = audio_player->synths;
+    SampleFormat sample_info = audio_player->sampleInfo_;
+    float sample_rate = sample_info.sampleRate_;
+    sample_rate *= 1.e-3;
+    int n, m;
+    for (n = 0;
+         n < n_in_chans;
+         n++) {
+        in[n] = &audio_player->indat[n*BLOCK_SIZE];
+        for (m = 0; m < n_frames; m++) {
+            in[n][m] = synth_tick(&synths[n],sample_rate);
+        }
+    }
+}
+
 void
 audio_callback(SLAndroidSimpleBufferQueueItf bq, void *userData)
 {
     audio_player_t *audio_player = userData;
-    synth_t *synth = &audio_player->synth;
     SampleFormat sample_info = audio_player->sampleInfo_;
-    float sample_rate = sample_info.sampleRate_;
-    sample_rate *= 1.e-3;
+    float out[sample_info.framesPerBuf_*sample_info.channels_];
+    memset(out,0,sizeof(float)*sample_info.framesPerBuf_*sample_info.channels_);
+    float *outs[] = {out,out+sample_info.framesPerBuf_};
+    SASpatSVZRenderer_render(audio_player->rend,
+            render_callback,outs,sample_info.framesPerBuf_,userData);
     int16_t *curbuf = audio_buffer_ring_get_cur_dat(audio_player->arng);
     audio_buffer_ring_rotate(audio_player->arng);
-    int n;
-    for (n = 0;
-         n < sample_info.framesPerBuf_;
-         n++) {
-        curbuf[n*audio_player->sampleInfo_.channels_] = (int16_t)(sin(synth->phs*2.*M_PI) * 0x7fff);
-        synth->phs += (1./sample_rate) * SINE_FREQ;
-        while (synth->phs >= 1.) {
-            synth->phs -= 1.;
+    int n, m;
+    for (n = 0; n < sample_info.channels_; n++) {
+        for (m = 0; m < sample_info.framesPerBuf_; m++) {
+            curbuf[sample_info.channels_*m+n] = outs[n][m] * 0x7fff;
         }
     }
     if (audio_player->done == 0) {
@@ -145,11 +187,22 @@ audio_callback(SLAndroidSimpleBufferQueueItf bq, void *userData)
 void
 make_sound(int samplerate, int framesperbuf)
 {
-    audio_player_t _ap = {
-        .synth = (synth_t) {
+    static synth_t synths[] = {{
             .phs = 0.,
-            .freq = 220.,
-        },
+            .freq = 0.5,
+            .crossed = 1.
+        },{
+            .phs = 0.333,
+            .freq = 0.5,
+            .crossed = 1.
+        },{
+            .phs = 0.666,
+            .freq = 0.5,
+            .crossed = 1.
+        }
+    };
+    audio_player_t _ap = {
+        .synths = synths,
         .sampleInfo_ = (SampleFormat) {
             .sampleRate_ = samplerate * 1000,
             .framesPerBuf_ = framesperbuf,
@@ -238,6 +291,34 @@ make_sound(int samplerate, int framesperbuf)
     result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_STOPPED);
     SLASSERT(result);
 
+    /* Space for data that render_callback uses for input data. The
+       SASpatSVZRenderer will never request more than BLOCK_SIZE frames,
+       so we allocate that much space for the input data. 
+       TODO: SASpatSVZRenderer should do this.
+       3 because 3 input channels 
+       2*_ap.sampleInfo_.framesPerBuf_ because that's
+       the amount of storage SASpatSVZRenderer has for 1 channel.
+     */
+    ap->indat = calloc(BLOCK_SIZE*3,
+            sizeof(float));
+    if (!ap->indat) {
+        goto cleanup;
+    }
+
+    ap->svz = SASpatSVZ_new(N_IN_CHANS, 
+            BLOCK_SIZE, SASpatSVZ_SampleRate_get_closest(sample_rate));
+    if (!ap->svz) {
+        goto cleanup;
+    }
+    ap->rend = SASpatSVZRenderer_new(ap->svz,
+            2*_ap.sampleInfo_.framesPerBuf_*_ap.sampleInfo_.channels_);
+    if (!ap->rend) {
+        goto cleanup;
+    }
+    SASpatSVZ_choose_preset(ap->svz,0,0);
+    SASpatSVZ_choose_preset(ap->svz,1,1);
+    SASpatSVZ_choose_preset(ap->svz,2,2);
+
     /* Enque something before starting to play? */
     audio_callback(playBufferQueueItf_,ap);
 
@@ -245,6 +326,8 @@ make_sound(int samplerate, int framesperbuf)
     SLASSERT(result);
 
     LOGI("Starting to play");
+    size_t num_presets = SASpatSVZ_get_num_presets();
+    LOGI("number of presets: %zu",num_presets);
     /* Play for 5 seconds (?) */
     //sleep(5);
     while (!ap->done);
@@ -252,7 +335,18 @@ make_sound(int samplerate, int framesperbuf)
     result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_STOPPED);
     SLASSERT(result);
 cleanup:
-    if (ap) { free(ap); }
+    if (ap) {
+        if (ap->indat) {
+            free(ap->indat);
+        }
+        if (ap->svz) {
+            SASpatSVZ_free(ap->svz);
+        }
+        if (ap->rend) {
+            SASpatSVZRenderer_free(ap->rend);
+        }
+        free(ap);
+    }
     if (playerObjectItf_ != NULL) {
         (*playerObjectItf_)->Destroy(playerObjectItf_);
     }
