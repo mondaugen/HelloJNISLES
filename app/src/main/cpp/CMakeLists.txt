@@ -2,7 +2,8 @@ cmake_minimum_required(VERSION 3.4.1)
 
 add_library(hello-jni SHARED
             hello-jni.c
-            /Users/audiblereality001/Documents/scraps/simple_audio_output_android/sles_simple_audio.c
+            sles_simple_audio.c
+            audio_buffer_ring.c
             )
 
 # Include libraries needed for hello-jni lib
