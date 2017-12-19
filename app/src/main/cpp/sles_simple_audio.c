@@ -8,6 +8,9 @@
 #include <math.h>
 #include "sa_spat_svz.h"
 #include "audio_buffer_ring.h"
+#include "sf1.h"
+#include "sf2.h"
+#include "sf3.h"
 
 #if 1
 
@@ -35,6 +38,7 @@
 #define DEVICE_SHADOW_BUFFER_QUEUE_LEN      4
 #define BLOCK_SIZE 512
 #define N_IN_CHANS 3
+#define N_OUT_CHANS 2
 
 #define SLASSERT(x)   do {\
     LOGI("Checking, x = %u",(unsigned)x);\
@@ -66,10 +70,41 @@ float synth_tick(synth_t *synth, float sample_rate)
 }
 
 struct wavetable_t {
-    int16_t *ptr;
+    float *start_ptr;
+    float *ptr;
+    int totlen;
     int remlen;
 };
 typedef struct wavetable_t wavetable_t;
+
+void
+wavetable_tick(wavetable_t *wt, float *out, int len)
+{
+    while (len) {
+        if (wt->remlen < len) {
+            memcpy(out,wt->ptr,wt->remlen*sizeof(float));
+            len -= wt->remlen;
+            wt->ptr = wt->start_ptr;
+            wt->remlen = wt->totlen;
+        } else {
+            memcpy(out,wt->ptr,len*sizeof(float));
+            wt->ptr += len;
+            wt->remlen -= len;
+            len = 0;
+        }
+    }
+}
+
+void
+wavetable_init(wavetable_t *wt, float *dat, int len)
+{
+    *wt = (wavetable_t) {
+        .start_ptr = dat,
+        .ptr = dat,
+        .totlen = len,
+        .remlen = len
+    };
+}
 
 struct SampleFormat {
     uint32_t   sampleRate_;
@@ -82,12 +117,14 @@ typedef struct SampleFormat SampleFormat;
 
 struct audio_player_t {
     synth_t *synths;
+    wavetable_t *wts;
     SampleFormat sampleInfo_;
     volatile int done;
     audio_buffer_ring_t *arng;
     SASpatSVZ *svz;
     SASpatSVZRenderer *rend;
     float *indat;
+    float *outs;
 };
 typedef struct audio_player_t audio_player_t;
 
@@ -102,7 +139,7 @@ void ConvertToSLSampleFormat(SLAndroidDataFormat_PCM_EX *pFormat,
         pFormat->numChannels = 1;
         pFormat->channelMask = SL_SPEAKER_FRONT_CENTER;
     } else {
-        pFormat->numChannels = 2;
+        pFormat->numChannels = N_OUT_CHANS;
         pFormat->channelMask = SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT;
     }
     pFormat->sampleRate  = pSampleInfo_->sampleRate_;
@@ -145,7 +182,7 @@ void render_callback (
             void *aux)
 {
     audio_player_t *audio_player = aux;
-    synth_t *synths = audio_player->synths;
+    //synth_t *synths = audio_player->synths;
     SampleFormat sample_info = audio_player->sampleInfo_;
     float sample_rate = sample_info.sampleRate_;
     sample_rate *= 1.e-3;
@@ -154,9 +191,10 @@ void render_callback (
          n < n_in_chans;
          n++) {
         in[n] = &audio_player->indat[n*BLOCK_SIZE];
-        for (m = 0; m < n_frames; m++) {
-            in[n][m] = synth_tick(&synths[n],sample_rate);
-        }
+        wavetable_tick(&audio_player->wts[n],in[n],n_frames);
+        //for (m = 0; m < n_frames; m++) {
+        //    in[n][m] = synth_tick(&synths[n],sample_rate);
+        //}
     }
 }
 
@@ -165,9 +203,9 @@ audio_callback(SLAndroidSimpleBufferQueueItf bq, void *userData)
 {
     audio_player_t *audio_player = userData;
     SampleFormat sample_info = audio_player->sampleInfo_;
-    float out[sample_info.framesPerBuf_*sample_info.channels_];
-    memset(out,0,sizeof(float)*sample_info.framesPerBuf_*sample_info.channels_);
-    float *outs[] = {out,out+sample_info.framesPerBuf_};
+    memset(audio_player->outs,0,
+            sizeof(float)*sample_info.framesPerBuf_*sample_info.channels_);
+    float *outs[] = {audio_player->outs,audio_player->outs+sample_info.framesPerBuf_};
     SASpatSVZRenderer_render(audio_player->rend,
             render_callback,outs,sample_info.framesPerBuf_,userData);
     int16_t *curbuf = audio_buffer_ring_get_cur_dat(audio_player->arng);
@@ -201,12 +239,17 @@ make_sound(int samplerate, int framesperbuf)
             .crossed = 1.
         }
     };
+    static wavetable_t wts[N_IN_CHANS];
+    wavetable_init(&wts[0],(float*)sf1,sizeof(sf1)/sizeof(float));
+    wavetable_init(&wts[1],(float*)sf2,sizeof(sf2)/sizeof(float));
+    wavetable_init(&wts[2],(float*)sf3,sizeof(sf3)/sizeof(float));
     audio_player_t _ap = {
         .synths = synths,
+        .wts = wts,
         .sampleInfo_ = (SampleFormat) {
             .sampleRate_ = samplerate * 1000,
             .framesPerBuf_ = framesperbuf,
-            .channels_ = 1,
+            .channels_ = 2,
             .pcmFormat_ = SL_PCMSAMPLEFORMAT_FIXED_16,
             /* doesn't seem representation_ is used */
         },
@@ -304,14 +347,19 @@ make_sound(int samplerate, int framesperbuf)
     if (!ap->indat) {
         goto cleanup;
     }
+    ap->outs = calloc(_ap.sampleInfo_.framesPerBuf_,
+            sizeof(float));
+    if (!ap->outs) {
+        goto cleanup;
+    }
 
-    ap->svz = SASpatSVZ_new(N_IN_CHANS, 
-            BLOCK_SIZE, SASpatSVZ_SampleRate_get_closest(sample_rate));
+    SASpatSVZ_SampleRate _sample_rate = SASpatSVZ_SampleRate_get_closest(sample_rate);
+    ap->svz = SASpatSVZ_new(N_IN_CHANS, BLOCK_SIZE, _sample_rate);
     if (!ap->svz) {
         goto cleanup;
     }
     ap->rend = SASpatSVZRenderer_new(ap->svz,
-            2*_ap.sampleInfo_.framesPerBuf_*_ap.sampleInfo_.channels_);
+            2*_ap.sampleInfo_.channels_);
     if (!ap->rend) {
         goto cleanup;
     }
@@ -338,6 +386,9 @@ cleanup:
     if (ap) {
         if (ap->indat) {
             free(ap->indat);
+        }
+        if (ap->outs) {
+            free(ap->outs);
         }
         if (ap->svz) {
             SASpatSVZ_free(ap->svz);
